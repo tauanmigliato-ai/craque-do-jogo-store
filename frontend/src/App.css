@@ -1,0 +1,5 @@
+/* Reset minimal — Tailwind cuida do resto */
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; }
+a { text-decoration: none; }
+button { cursor: pointer; }
