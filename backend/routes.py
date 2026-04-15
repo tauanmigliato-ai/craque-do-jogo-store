@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi import Query
 from database import get_db_ctx
 from auth import hash_password, verify_password, create_access_token, get_current_user, get_admin_user
@@ -481,9 +481,33 @@ def initiate_pix_payment(order_id: int, current_user: dict = Depends(get_current
 
 
 @router.post("/webhooks/pagarme")
-def pagarme_webhook(payload: dict):
+async def pagarme_webhook(request: Request):
     """Webhook do Pagar.me para confirmar pagamento"""
+    import hmac as hmac_mod
+    import hashlib
+    import logging
     from config import settings
+
+    body = await request.body()
+
+    # Valida assinatura se API key estiver configurada
+    if settings.PAGARME_API_KEY:
+        sig_header = request.headers.get("X-Hub-Signature", "")
+        expected = "sha1=" + hmac_mod.new(
+            settings.PAGARME_API_KEY.encode(),
+            body,
+            hashlib.sha1,
+        ).hexdigest()
+        if not hmac_mod.compare_digest(sig_header, expected):
+            raise HTTPException(status_code=400, detail="Assinatura inválida")
+    else:
+        logging.warning("PAGARME_API_KEY não configurada — webhook sem validação (dev only)")
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload inválido")
+
     if payload.get("current_status") == "paid":
         order_id = payload.get("order_id")
         if order_id:
