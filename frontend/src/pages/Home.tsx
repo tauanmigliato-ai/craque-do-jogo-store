@@ -129,12 +129,8 @@ export default function Home() {
           <h2 className="text-2xl font-bold mb-6">Explore por categoria</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {[
-              { slug: 'brasileiros', label: 'Brasileiros', emoji: '🇧🇷' },
-              { slug: 'internacionais', label: 'Internacionais', emoji: '🌍' },
-              { slug: 'selecoes', label: 'Seleções', emoji: '⚽' },
-              { slug: 'nba', label: 'NBA', emoji: '🏀' },
-              { slug: 'mlb', label: 'MLB', emoji: '⚾' },
-              { slug: 'retro', label: 'Camisas Retrô', emoji: '👕' },
+              { slug: 'copa-do-mundo', label: 'Copa do Mundo 2026', emoji: '🌍' },
+              { slug: 'brasileirao',   label: 'Brasileirão',        emoji: '🇧🇷' },
             ].map(cat => (
               <Link key={cat.slug} to={`/catalogo?category=${cat.slug}`}
                 className="bg-white rounded-xl p-6 text-center hover:shadow-md transition group">
