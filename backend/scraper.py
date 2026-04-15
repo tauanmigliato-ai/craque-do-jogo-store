@@ -1,148 +1,243 @@
 #!/usr/bin/env python3
 """
-Scraper de imagens do Yupoo para o Craque Do Jogo Store.
-Baixa imagens organizadas por time/categoria para /opt/craque-do-jogo/uploads/
+Scraper para minkang.x.yupoo.com
+Navega: categorias → times → álbuns → imagens
+Salva imagens + metadata.json com dados corretos por produto.
 """
 import os
 import re
 import time
+import json
 import hashlib
 import requests
-from urllib.parse import urlparse
+from typing import Optional
 
 UPLOAD_DIR = "/opt/craque-do-jogo/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+METADATA_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
+BASE_URL = "https://minkang.x.yupoo.com"
 
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Referer": "https://camisetafutbol.x.yupoo.com/",
+    "Referer": "https://minkang.x.yupoo.com/",
 })
 
-# Times que queremos
-TARGET_TERMS = [
-    "Flamengo", "Corinthians", "Palmeiras", "São Paulo", "Cruzeiro", "Atlético",
-    "Santos", "Vasco", "Grêmio", "Internacional", "Botafogo", "Fluminense",
-    "Bahia", "Sport", "Ceará", "Athletico",
-    "Real Madrid", "Barcelona", "Liverpool", "Manchester", "PSG", "Bayern",
-    "Juventus", "Chelsea", "Arsenal", "Milan", "Inter Milan", "Benfica", "Porto",
-    "Brasil", "Argentina", "França", "Alemanha", "Italia", "Portugal", "Espanha",
-    "Inglaterra", "Holanda", "Uruguai",
-    "Lakers", "Celtics", "Warriors", "Bulls", "Heat", "Nets", "Knicks", "Suns",
-    "Mavericks", "Bucks", "Nuggets", "Clippers",
-    "Yankees", "Dodgers", "Red Sox", "Cubs", "Astros", "Giants",
+TARGET_LEAGUES = [
+    {
+        "name": "Copa do Mundo 2026",
+        "slug": "copa-do-mundo",
+        "keywords": ["copa do mundo", "world cup", "2026"],
+        "category_id": None,
+    },
+    {
+        "name": "Brasileirão",
+        "slug": "brasileirao",
+        "keywords": ["brasileiro", "brasileirão", "série a", "serie a"],
+        "category_id": "680738",
+    },
 ]
 
-def slug(text: str) -> str:
-    text = re.sub(r"[^\w\s]", "", text.lower())
-    text = re.sub(r"[\s]+", "-", text.strip())
-    return text[:40]
+TYPE_PRIORITY = ["home", "away", "third"]
 
-def make_unique_name(url: str, page: int, idx: int) -> str:
-    # Cria nome único baseado no hash da URL
-    h = hashlib.md5(url.encode()).hexdigest()[:8]
-    ext = url.split(".")[-1] if "." in url else "jpg"
-    return f"{page:03d}_{idx:03d}_{h}.{ext}"
+TYPE_KEYWORDS = {
+    "home": ["home"],
+    "away": ["away"],
+    "third": ["third", "3rd"],
+}
 
-def get_page(url: str, retries=3):
-    for i in range(retries):
-        try:
-            resp = SESSION.get(url, timeout=20)
-            if resp.status_code == 200:
-                return resp.text
-            time.sleep(2)
-        except Exception as e:
-            print(f"  Retry {i+1}: {e}")
-            time.sleep(3)
-    return ""
+SKIP_KEYWORDS = ["kids", "children", "baby", "infant", "goalkeeper", "gk", "women", "female", "polo", "shorts", "socks", "jacket", "windbreaker", "training"]
 
-def extract_images(html: str) -> list[str]:
-    """Extrai URLs de imagem do Yupoo."""
-    # Padrão: photo.yupoo.com com /small.jpg ou /medium.jpg
-    pattern = re.compile(r'src="(https://photo\.yupoo\.com/[^"]+\.(?:jpg|jpeg|png))"')
-    urls = []
-    seen = set()
+
+def detect_type(album_title: str) -> Optional[str]:
+    """Detecta o tipo (home/away/third) a partir do nome do álbum."""
+    title_lower = album_title.lower()
+
+    if any(kw in title_lower for kw in SKIP_KEYWORDS):
+        return None
+
+    for kit_type in TYPE_PRIORITY:
+        for keyword in TYPE_KEYWORDS[kit_type]:
+            if keyword in title_lower:
+                return kit_type
+
+    return None
+
+
+def find_category_ids(html: str, keywords: list) -> list:
+    """Encontra IDs de categorias cujo texto de link contenha alguma das keywords."""
+    pattern = re.compile(r'href="/categories/(\d+)"[^>]*>([^<]+)<', re.IGNORECASE)
+    results = []
     for match in pattern.finditer(html):
-        url = match.group(1).replace("/small.jpg", "/medium.jpg").replace("/thumbs/", "/")
+        cat_id, label = match.group(1), match.group(2).lower()
+        if any(kw.lower() in label for kw in keywords):
+            results.append(cat_id)
+    return results
+
+
+def parse_subcategories(html: str) -> list:
+    """Extrai (nome, id) de subcategorias de time (?isSubCate=true)."""
+    pattern = re.compile(r'href="/categories/(\d+)\?isSubCate=true"[^>]*>([^<]+)<', re.IGNORECASE)
+    return [(m.group(2).strip(), m.group(1)) for m in pattern.finditer(html)]
+
+
+def parse_albums(html: str) -> list:
+    """Extrai (título, id) de álbuns da página de um time."""
+    pattern = re.compile(r'href="/albums/(\d+)"[^>]*>([^<]+)<', re.IGNORECASE)
+    seen = set()
+    results = []
+    for m in pattern.finditer(html):
+        album_id, title = m.group(1), m.group(2).strip()
+        if album_id not in seen and title:
+            seen.add(album_id)
+            results.append((title, album_id))
+    return results
+
+
+def parse_image_urls(html: str) -> list:
+    """Extrai URLs de imagem do Yupoo, normalizando para /medium.jpg."""
+    pattern = re.compile(r'src="(https://photo\.yupoo\.com/[^"]+\.(?:jpg|jpeg|png))"', re.IGNORECASE)
+    seen = set()
+    urls = []
+    for m in pattern.finditer(html):
+        url = m.group(1)
+        url = re.sub(r'/small\.', '/medium.', url)
+        url = re.sub(r'/thumbs/', '/', url)
         if url not in seen:
             seen.add(url)
             urls.append(url)
     return urls
 
-def should_keep(name: str, team: str) -> bool:
-    """Filtra se deve baixar basedo no time."""
-    name_lower = (name + " " + team).lower()
-    for term in TARGET_TERMS:
-        if term.lower() in name_lower:
-            return True
-    return False
 
-def download_image(url: str, dest: str, retries=2) -> bool:
+def make_filename(url: str) -> str:
+    """Gera nome de arquivo determinístico a partir da URL."""
+    h = hashlib.md5(url.encode()).hexdigest()[:12]
+    ext = url.rsplit(".", 1)[-1].split("?")[0] if "." in url else "jpg"
+    return f"{h}.{ext}"
+
+
+def download_image(url: str, retries: int = 2) -> Optional[str]:
+    """Baixa imagem para UPLOAD_DIR. Retorna filename ou None se falhar."""
+    filename = make_filename(url)
+    dest = os.path.join(UPLOAD_DIR, filename)
+
+    if os.path.exists(dest) and os.path.getsize(dest) > 5000:
+        return filename
+
     for attempt in range(retries):
         try:
             resp = SESSION.get(url, timeout=30, stream=True)
-            if resp.status_code == 200:
-                content = resp.content
-                if len(content) > 5000:  # filtro de imagens mínimas
-                    with open(dest, "wb") as f:
-                        f.write(content)
-                    return True
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+                return filename
         except Exception as e:
-            print(f"    Erro {attempt+1}: {e}")
+            print(f"    [retry {attempt+1}] {e}")
         time.sleep(1)
-    return False
 
-def scrape_page(page: int) -> list[str]:
-    url = f"https://camisetafutbol.x.yupoo.com/albums?tab=gallery&page={page}"
-    print(f"\n[{page}/20] {url}")
-    html = get_page(url)
-    if not html:
-        print("  Falha ao carregar")
-        return []
-    return extract_images(html)
+    return None
 
-def run():
-    print("=== Scraper Yupoo - Craque Do Jogo Store ===\n")
-    all_urls = []
 
-    for page in range(1, 21):
-        images = scrape_page(page)
-        all_urls.extend(images)
-        print(f"  -> {len(images)} imagens nesta página")
+def save_metadata(entries: list) -> None:
+    """Grava metadata.json com todas as entradas coletadas."""
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=2)
+    print(f"\nmetadata.json salvo: {len(entries)} produtos em {METADATA_PATH}")
+
+
+def get_page(url: str, retries: int = 3) -> str:
+    """Fetch HTML de uma URL com retry."""
+    for i in range(retries):
+        try:
+            resp = SESSION.get(url, timeout=20)
+            if resp.status_code == 200:
+                return resp.text
+            print(f"  HTTP {resp.status_code}: {url}")
+        except Exception as e:
+            print(f"  Erro (tentativa {i+1}): {e}")
+        time.sleep(2)
+    return ""
+
+
+def scrape_league(league: dict) -> list:
+    """Scrapa uma liga inteira. Retorna lista de entradas para metadata.json."""
+    entries = []
+    category_id = league["category_id"]
+
+    if category_id is None:
+        html = get_page(f"{BASE_URL}/categories")
+        ids = find_category_ids(html, league["keywords"])
+        if not ids:
+            print(f"  [WARN] Liga não encontrada: {league['name']}")
+            return []
+        category_id = ids[0]
+        print(f"  Liga '{league['name']}' encontrada: ID {category_id}")
         time.sleep(1.5)
 
-    print(f"\nTotal coletado: {len(all_urls)} imagens\n")
+    html = get_page(f"{BASE_URL}/categories/{category_id}")
+    subcats = parse_subcategories(html)
+    print(f"  {len(subcats)} times encontrados em {league['name']}")
 
-    # Download
-    downloaded = 0
-    skipped = 0
-    for i, url in enumerate(all_urls):
-        filename = make_unique_name(url, (i // 40) + 1, i % 40)
-        dest = os.path.join(UPLOAD_DIR, filename)
+    for team_name, team_id in subcats:
+        time.sleep(1.5)
+        html = get_page(f"{BASE_URL}/categories/{team_id}?isSubCate=true")
+        albums = parse_albums(html)
 
-        if os.path.exists(dest) and os.path.getsize(dest) > 5000:
-            skipped += 1
-            if (i+1) % 50 == 0:
-                print(f"  [{i+1}/{len(all_urls)}] Já existe: {filename}")
-            continue
+        seen_types: dict = {}
+        for album_title, album_id in albums:
+            kit_type = detect_type(album_title)
+            if kit_type is None or kit_type in seen_types:
+                continue
 
-        ok = download_image(url, dest)
-        if ok:
-            downloaded += 1
-            size = os.path.getsize(dest) / 1024
-            print(f"  [{i+1}/{len(all_urls)}] ✓ {filename} ({size:.0f}KB)")
-        else:
-            print(f"  [{i+1}/{len(all_urls)}] ✗ {url[:60]}...")
+            time.sleep(1.5)
+            album_html = get_page(f"{BASE_URL}/albums/{album_id}")
+            image_urls = parse_image_urls(album_html)
 
-        if (i+1) % 20 == 0:
-            time.sleep(2)
+            if not image_urls:
+                print(f"    [SKIP] Sem imagens: {album_title}")
+                continue
 
-    print(f"\n\n=== Download concluído ===")
-    print(f"  Novas: {downloaded}")
-    print(f"  Puladas: {skipped}")
-    print(f"  Pasta: {UPLOAD_DIR}")
+            downloaded = []
+            for img_url in image_urls:
+                filename = download_image(img_url)
+                if filename:
+                    downloaded.append(filename)
+                time.sleep(1)
+
+            if not downloaded:
+                print(f"    [SKIP] Download falhou: {album_title}")
+                continue
+
+            entries.append({
+                "league": league["name"],
+                "league_slug": league["slug"],
+                "team": team_name,
+                "type": kit_type,
+                "album_name": album_title,
+                "album_url": f"{BASE_URL}/albums/{album_id}",
+                "images": downloaded,
+            })
+            seen_types[kit_type] = True
+            print(f"    ✓ {team_name} {kit_type}: {len(downloaded)} imagens")
+
+    return entries
+
+
+def run():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    print("=== Scraper Minkang — Craque Do Jogo Store ===\n")
+    all_entries = []
+
+    for league in TARGET_LEAGUES:
+        print(f"\n[Liga] {league['name']}")
+        entries = scrape_league(league)
+        all_entries.extend(entries)
+        print(f"  → {len(entries)} produtos coletados")
+
+    save_metadata(all_entries)
+    print(f"\n=== Concluído: {len(all_entries)} produtos no total ===")
+
 
 if __name__ == "__main__":
     run()
