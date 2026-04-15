@@ -89,3 +89,6 @@ CREATE INDEX IF NOT EXISTS idx_products_featured ON products(featured);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_cart_user ON cart_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_products_league ON products(league);
+CREATE INDEX IF NOT EXISTS idx_products_team   ON products(team);
+CREATE INDEX IF NOT EXISTS idx_products_type   ON products(type);
