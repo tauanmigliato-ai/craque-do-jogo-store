@@ -1,148 +1,123 @@
 #!/usr/bin/env python3
 """
-Popula o banco de dados com produtos a partir das imagens baixadas.
-Funciona a partir dos nomes dos arquivos (pXXX_YYY_hash.ext).
+Popula o banco a partir do metadata.json gerado pelo scraper.
+Executa: python populate_db.py
 """
-import os, sys, json
-sys.path.insert(0, '/opt/craque-do-jogo/backend')
+import os
+import sys
+import json
+import sqlite3
+import re
 
-from database import get_db_ctx, init_db
-import hashlib
+METADATA_PATH = "/opt/craque-do-jogo/uploads/metadata.json"
 
-UPLOAD_DIR = "/opt/craque-do-jogo/uploads"
-
-# Mapeamento de times brasileiros
-TEAMS = [
-    ("Flamengo", "Brasileirão", "Flamengo"),
-    ("Corinthians", "Brasileirão", "Corinthians"),
-    ("Palmeiras", "Brasileirão", "Palmeiras"),
-    ("São Paulo FC", "Brasileirão", "São Paulo"),
-    ("Cruzeiro", "Brasileirão", "Cruzeiro"),
-    ("Atlético-MG", "Brasileirão", "Atlético"),
-    ("Santos", "Brasileirão", "Santos"),
-    ("Vasco da Gama", "Brasileirão", "Vasco"),
-    ("Grêmio", "Brasileirão", "Grêmio"),
-    ("Internacional", "Brasileirão", "Internacional"),
-    ("Botafogo", "Brasileirão", "Botafogo"),
-    ("Fluminense", "Brasileirão", "Fluminense"),
-    ("Bahia", "Brasileirão", "Bahia"),
-    ("Sport Club", "Brasileirão", "Sport"),
-    ("Ceará", "Brasileirão", "Ceará"),
-    ("Athletico-PR", "Brasileirão", "Athletico"),
-    ("Real Madrid", "La Liga", "Real Madrid"),
-    ("FC Barcelona", "La Liga", "Barcelona"),
-    ("Liverpool FC", "Premier League", "Liverpool"),
-    ("Manchester United", "Premier League", "Manchester United"),
-    ("Manchester City", "Premier League", "Manchester City"),
-    ("PSG", "Ligue 1", "PSG"),
-    ("Bayern München", "Bundesliga", "Bayern"),
-    ("Juventus", "Serie A", "Juventus"),
-    ("Chelsea FC", "Premier League", "Chelsea"),
-    ("Arsenal FC", "Premier League", "Arsenal"),
-    ("AC Milan", "Serie A", "Milan"),
-    ("Inter Milan", "Serie A", "Inter"),
-    ("SL Benfica", "Liga Portugal", "Benfica"),
-    ("FC Porto", "Liga Portugal", "Porto"),
-    ("Seleção Brasileira", "Seleções", "Brasil"),
-    ("Seleção Argentina", "Seleções", "Argentina"),
-    ("Seleção da França", "Seleções", "França"),
-    ("Seleção da Alemanha", "Seleções", "Alemanha"),
-    ("Seleção Italiana", "Seleções", "Italia"),
-    ("Seleção de Portugal", "Seleções", "Portugal"),
-    ("Seleção da Espanha", "Seleções", "Espanha"),
-    ("Seleção Inglesa", "Seleções", "Inglaterra"),
-    ("Seleção Holandesa", "Seleções", "Holanda"),
-    ("Los Angeles Lakers", "NBA", "Lakers"),
-    ("Boston Celtics", "NBA", "Celtics"),
-    ("Golden State Warriors", "NBA", "Warriors"),
-    ("Chicago Bulls", "NBA", "Bulls"),
-    ("Miami Heat", "NBA", "Heat"),
-    ("New York Knicks", "NBA", "Knicks"),
-    ("Brooklyn Nets", "NBA", "Nets"),
-    ("Phoenix Suns", "NBA", "Suns"),
-    ("Dallas Mavericks", "NBA", "Mavericks"),
-    ("Milwaukee Bucks", "NBA", "Bucks"),
-    ("Denver Nuggets", "NBA", "Nuggets"),
-    ("LA Clippers", "NBA", "Clippers"),
-    ("New York Yankees", "MLB", "Yankees"),
-    ("Los Angeles Dodgers", "MLB", "Dodgers"),
-    ("Boston Red Sox", "MLB", "Red Sox"),
-    ("Chicago Cubs", "MLB", "Cubs"),
-    ("Houston Astros", "MLB", "Astros"),
-    ("San Francisco Giants", "MLB", "Giants"),
+CATEGORIES = [
+    {"name": "Copa do Mundo 2026", "slug": "copa-do-mundo"},
+    {"name": "Brasileirão",        "slug": "brasileirao"},
 ]
 
-TYPES = ["home", "away", "third", "retro"]
 SIZES = ["P", "M", "G", "GG", "XG"]
 
 
-def slug(name: str) -> str:
-    import re
-    name = re.sub(r'[^\w\s]', '', name.lower())
-    name = re.sub(r'[\s]+', '-', name.strip())
-    return name[:60]
+def calcular_preco(league: str, kit_type: str) -> float:
+    """Retorna preço base pelo tipo e liga."""
+    if kit_type == "third":
+        return 189.90
+    return 175.90
 
 
-def populate():
+def _slug(text: str) -> str:
+    text = re.sub(r"[^\w\s]", "", text.lower())
+    text = re.sub(r"\s+", "-", text.strip())
+    return text[:60]
+
+
+def populate_with_conn(conn: sqlite3.Connection, entries: list) -> None:
+    """Popula banco a partir de lista de entradas. Recebe conexão aberta (testável)."""
+    conn.execute("DELETE FROM products")
+    conn.execute("DELETE FROM categories")
+    conn.commit()
+
+    # Cria categorias
+    cat_map: dict = {}
+    for cat in CATEGORIES:
+        cur = conn.execute(
+            "INSERT INTO categories (name, slug) VALUES (?, ?)",
+            (cat["name"], cat["slug"]),
+        )
+        cat_map[cat["slug"]] = cur.lastrowid
+    conn.commit()
+
+    # Insere produtos
+    inserted = 0
+    for entry in entries:
+        league = entry["league"]
+        league_slug = entry["league_slug"]
+        team = entry["team"]
+        kit_type = entry["type"]
+        images = entry["images"]
+
+        if not images:
+            print(f"  [SKIP] Sem imagens: {team} {kit_type}")
+            continue
+
+        category_id = cat_map.get(league_slug)
+        price = calcular_preco(league, kit_type)
+        compare_price = round(price + 40, 2)
+        image_url = f"/uploads/{images[0]}"
+        images_json = json.dumps([f"/uploads/{img}" for img in images])
+        product_name = f"{team} {kit_type.title()} 2025-26"
+        product_slug = _slug(product_name)
+        featured = 1 if inserted < 20 else 0
+
+        existing = conn.execute(
+            "SELECT id FROM products WHERE slug=?", (product_slug,)
+        ).fetchone()
+        if existing:
+            print(f"  [SKIP] Já existe: {product_slug}")
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO products
+              (name, slug, price, compare_price, image_url, images, sizes,
+               category_id, team, league, type, stock, featured, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                product_name, product_slug, price, compare_price,
+                image_url, images_json, json.dumps(SIZES),
+                category_id, team, league, kit_type,
+                10, featured,
+            ),
+        )
+        inserted += 1
+        if inserted % 10 == 0:
+            print(f"  {inserted} produtos inseridos...")
+
+    conn.commit()
+    total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    print(f"\n=== Concluído: {inserted} produtos inseridos (total no banco: {total}) ===")
+
+
+def populate() -> None:
+    """Entry point para execução na VPS."""
+    if not os.path.exists(METADATA_PATH):
+        print(f"ERRO: {METADATA_PATH} não encontrado. Execute o scraper primeiro.")
+        sys.exit(1)
+
+    with open(METADATA_PATH, encoding="utf-8") as f:
+        entries = json.load(f)
+
+    print(f"metadata.json carregado: {len(entries)} entradas")
+
+    # Importa funções do backend da VPS
+    sys.path.insert(0, "/opt/craque-do-jogo/backend")
+    from database import get_db_ctx, init_db
+
     init_db()
-    files = [f for f in os.listdir(UPLOAD_DIR)
-             if f.endswith(('.jpg', '.jpeg', '.png')) and os.path.getsize(os.path.join(UPLOAD_DIR, f)) > 50000]
-
-    print(f"Encontrados {len(files)} imagens (50KB+)")
-    if not files:
-        print("Nenhuma imagem grande o suficiente..Execute o scraper primeiro.")
-        return
-
-    # Dividir em lotes de times
-    products_per_team = max(1, len(files) // len(TEAMS))
-
     with get_db_ctx() as conn:
-        created = 0
-        base_idx = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-
-        for i, filename in enumerate(sorted(files)):
-            team_idx = i // products_per_team
-            if team_idx >= len(TEAMS):
-                team_idx = i % len(TEAMS)
-
-            team_name, league, team = TEAMS[team_idx]
-            img_type = TYPES[i % len(TYPES)]
-
-            # Nome do produto
-            name = f"{team_name} {img_type.title()} {2024 + (i % 2)}-{2025 + (i % 2)}"
-            product_slug = slug(name)
-
-            # Verificar se já existe
-            existing = conn.execute("SELECT id FROM products WHERE slug=?", (product_slug,)).fetchone()
-            if existing:
-                continue
-
-            # URL da imagem (via FastAPI serve uploads)
-            image_url = f"/uploads/{filename}"
-
-            # Preço baseado no tipo (retro é mais caro)
-            base_price = 189.90 if img_type == "retro" else 219.90
-            compare_price = base_price + 40
-
-            cur = conn.execute("""
-                INSERT INTO products
-                (name, slug, price, compare_price, image_url, sizes, league, team, type, stock, featured, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                name, product_slug,
-                base_price, compare_price,
-                image_url, json.dumps(SIZES),
-                league, team, img_type,
-                10, 1 if i < 30 else 0, 1
-            ))
-            created += 1
-            if created % 20 == 0:
-                print(f"  {created} produtos criados...")
-
-        print(f"\n=== CONCLUIDO ===")
-        print(f"  {created} novos produtos criados")
-        total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        print(f"  Total no banco: {total}")
+        populate_with_conn(conn, entries)
 
 
 if __name__ == "__main__":
