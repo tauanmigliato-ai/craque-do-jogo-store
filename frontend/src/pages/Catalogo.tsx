@@ -68,8 +68,8 @@ export default function Catalogo() {
           <div className="bg-white rounded-xl p-4 shadow-sm sticky top-24">
             <h3 className="font-bold mb-3 text-sm">Categorias</h3>
             <ul className="space-y-1">
-              {['', 'brasileiros', 'internacionais', 'selecoes', 'nba', 'mlb'].map(cat => {
-                const labels: Record<string, string> = { '': 'Todos', brasileiros: '🇧🇷 Brasileiros', internacionais: '🌍 Internacionais', selecoes: '⚽ Seleções', nba: '🏀 NBA', mlb: '⚾ MLB' }
+              {['', 'copa-do-mundo', 'brasileirao'].map(cat => {
+                const labels: Record<string, string> = { '': 'Todos', 'copa-do-mundo': '🌍 Copa do Mundo 2026', 'brasileirao': '🇧🇷 Brasileirão' }
                 return (
                   <li key={cat}>
                     <button
