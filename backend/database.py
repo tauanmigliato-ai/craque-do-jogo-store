@@ -55,14 +55,10 @@ def init_db():
         conn.executescript(schema)
         if settings.ADMIN_PASSWORD:
             from auth import hash_password
-            cur = conn.execute(
-                "SELECT id FROM users WHERE email = ?", (settings.ADMIN_EMAIL,)
+            conn.execute(
+                "INSERT OR IGNORE INTO users (email, name, password_hash, role) VALUES (?, ?, ?, ?)",
+                (settings.ADMIN_EMAIL, "Admin", hash_password(settings.ADMIN_PASSWORD), "admin"),
             )
-            if not cur.fetchone():
-                conn.execute(
-                    "INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, ?)",
-                    (settings.ADMIN_EMAIL, "Admin", hash_password(settings.ADMIN_PASSWORD), "admin"),
-                )
 
 
 if __name__ == "__main__":
