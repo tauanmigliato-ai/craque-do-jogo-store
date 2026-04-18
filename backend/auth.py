@@ -1,8 +1,9 @@
-import secrets
 import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
@@ -11,14 +12,22 @@ from config import settings
 
 security = HTTPBearer()
 
+_LEGACY_SALT = "craque_salt_v1"
+
 
 def hash_password(password: str) -> str:
-    salt = "craque_salt_v1"
-    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
+def verify_password(plain: str, hashed: str) -> bool:
+    if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    legacy = hashlib.sha256(f"{_LEGACY_SALT}{plain}".encode()).hexdigest()
+    return hmac.compare_digest(legacy, hashed)
+
+
+def needs_rehash(hashed: str) -> bool:
+    return not (hashed.startswith("$2b$") or hashed.startswith("$2a$"))
 
 
 def create_access_token(data: dict) -> str:

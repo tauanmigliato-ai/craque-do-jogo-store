@@ -1,25 +1,39 @@
+import hashlib
+import hmac
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+from collections import defaultdict
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi import Query
-from database import get_db_ctx
-from auth import hash_password, verify_password, create_access_token, get_current_user, get_admin_user
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+from auth import (
+    hash_password, verify_password, needs_rehash,
+    create_access_token, get_current_user, get_admin_user,
+)
+from database import get_db_ctx, get_db_exclusive
 from models import (
     User, UserCreate, UserLogin, UserUpdate, Token,
     Category, CategoryCreate,
     Product, ProductCreate, ProductUpdate,
     CartItem, CartItemCreate,
-    Order, OrderCreate, OrderItem,
+    Order, OrderCreate, OrderItem, OrderStatus,
     PaginatedResponse,
 )
-from typing import Optional
 
 router = APIRouter(prefix="/api")
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 @router.post("/auth/register", response_model=Token)
-def register(data: UserCreate):
+@limiter.limit("5/minute")
+def register(request: Request, data: UserCreate):
     with get_db_ctx() as conn:
         exists = conn.execute("SELECT id FROM users WHERE email = ?", (data.email,)).fetchone()
         if exists:
@@ -34,13 +48,19 @@ def register(data: UserCreate):
 
 
 @router.post("/auth/login", response_model=Token)
-def login(data: UserLogin):
+@limiter.limit("10/minute")
+def login(request: Request, data: UserLogin):
     with get_db_ctx() as conn:
         row = conn.execute(
             "SELECT id, email, name, password_hash, role FROM users WHERE email = ?", (data.email,)
         ).fetchone()
         if not row or not verify_password(data.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+        if needs_rehash(row["password_hash"]):
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(data.password), row["id"]),
+            )
         token = create_access_token({"sub": data.email, "role": row["role"], "user_id": row["id"]})
         return Token(access_token=token)
 
@@ -93,7 +113,7 @@ def update_category(cat_id: int, data: CategoryCreate, _=Depends(get_admin_user)
 @router.delete("/categories/{cat_id}")
 def delete_category(cat_id: int, _=Depends(get_admin_user)):
     with get_db_ctx() as conn:
-        cur = conn.execute("UPDATE products SET category_id=null WHERE category_id=?", (cat_id,))
+        conn.execute("UPDATE products SET category_id=null WHERE category_id=?", (cat_id,))
         conn.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
         return {"ok": True}
 
@@ -301,11 +321,11 @@ def clear_cart(current_user: dict = Depends(get_current_user)):
 
 @router.post("/orders", response_model=Order)
 def create_order(data: OrderCreate, current_user: dict = Depends(get_current_user)):
-    with get_db_ctx() as conn:
-        # calculate total from cart
+    with get_db_exclusive() as conn:
         cart_rows = conn.execute(
-            """SELECT ci.*, p.price, p.stock FROM cart_items ci
-            JOIN products p ON ci.product_id=p.id WHERE ci.user_id=?""",
+            """SELECT ci.product_id, ci.size, ci.quantity, p.price, p.stock, p.name
+            FROM cart_items ci JOIN products p ON ci.product_id=p.id
+            WHERE ci.user_id=?""",
             (current_user["user_id"],),
         ).fetchall()
         if not cart_rows:
@@ -314,6 +334,15 @@ def create_order(data: OrderCreate, current_user: dict = Depends(get_current_use
         total = 0
         order_items = []
         for r in cart_rows:
+            updated = conn.execute(
+                "UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?",
+                (r["quantity"], r["product_id"], r["quantity"]),
+            )
+            if updated.rowcount == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Estoque insuficiente: {r['name']}",
+                )
             unit_price = r["price"]
             total += unit_price * r["quantity"]
             order_items.append((r["product_id"], r["size"], r["quantity"], unit_price))
@@ -335,7 +364,6 @@ def create_order(data: OrderCreate, current_user: dict = Depends(get_current_use
                 "INSERT INTO order_items (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
                 (order_id, pid, size, qty, price),
             )
-        # clear cart
         conn.execute("DELETE FROM cart_items WHERE user_id = ?", (current_user["user_id"],))
 
         order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
@@ -345,6 +373,22 @@ def create_order(data: OrderCreate, current_user: dict = Depends(get_current_use
         return result
 
 
+def _attach_items(conn, orders: list[dict]) -> list[dict]:
+    if not orders:
+        return orders
+    ids = [o["id"] for o in orders]
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT * FROM order_items WHERE order_id IN ({placeholders})", ids
+    ).fetchall()
+    by_order: dict[int, list] = defaultdict(list)
+    for r in rows:
+        by_order[r["order_id"]].append(dict(r))
+    for o in orders:
+        o["items"] = by_order[o["id"]]
+    return orders
+
+
 @router.get("/orders/my")
 def my_orders(current_user: dict = Depends(get_current_user)):
     with get_db_ctx() as conn:
@@ -352,14 +396,7 @@ def my_orders(current_user: dict = Depends(get_current_user)):
             "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC",
             (current_user["user_id"],),
         ).fetchall()
-        result = []
-        for r in rows:
-            order = dict(r)
-            order["items"] = [
-                dict(i) for i in conn.execute("SELECT * FROM order_items WHERE order_id = ?", (r["id"],)).fetchall()
-            ]
-            result.append(order)
-        return result
+        return _attach_items(conn, [dict(r) for r in rows])
 
 
 @router.get("/orders/{order_id}")
@@ -368,12 +405,13 @@ def get_order(order_id: int, current_user: dict = Depends(get_current_user)):
         row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Pedido não encontrado")
-        # clients can only see their own orders
         if current_user.get("role") != "admin" and row["user_id"] != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Acesso negado")
         order = dict(row)
         order["items"] = [
-            dict(i) for i in conn.execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,)).fetchall()
+            dict(i) for i in conn.execute(
+                "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
+            ).fetchall()
         ]
         return order
 
@@ -403,21 +441,22 @@ def admin_list_orders(
             WHERE {where_sql} ORDER BY o.created_at DESC LIMIT ? OFFSET ?""",
             params + [per_page, offset],
         ).fetchall()
-        result = []
-        for r in rows:
-            order = dict(r)
-            order["items"] = [
-                dict(i) for i in conn.execute("SELECT * FROM order_items WHERE order_id = ?", (r["id"],)).fetchall()
-            ]
-            result.append(order)
-        return {"items": result, "total": total, "page": page, "per_page": per_page,
+        orders = _attach_items(conn, [dict(r) for r in rows])
+        return {"items": orders, "total": total, "page": page, "per_page": per_page,
                 "pages": (total + per_page - 1) // per_page}
 
 
+class StatusUpdate(BaseModel):
+    status: OrderStatus
+
+
 @router.patch("/admin/orders/{order_id}/status")
-def admin_update_status(order_id: int, status: str, _=Depends(get_admin_user)):
+def admin_update_status(order_id: int, body: StatusUpdate, _=Depends(get_admin_user)):
     with get_db_ctx() as conn:
-        conn.execute("UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, order_id))
+        conn.execute(
+            "UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (body.status.value, order_id),
+        )
         return {"ok": True}
 
 
@@ -430,16 +469,23 @@ def admin_stats(_=Depends(get_admin_user)):
             "total_products": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0],
             "total_orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
             "total_clients": conn.execute("SELECT COUNT(*) FROM users WHERE role='client'").fetchone()[0],
-            "revenue": conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status IN ('paid','shipped','delivered')").fetchone()[0],
+            "revenue": conn.execute(
+                "SELECT COALESCE(SUM(total),0) FROM orders WHERE status IN ('paid','shipped','delivered')"
+            ).fetchone()[0],
             "pending_orders": conn.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0],
         }
 
 
 # ─── Pagar.me PIX ─────────────────────────────────────────────────────────────
 
+def _verify_pagarme_signature(body: bytes, signature: str, secret: str) -> bool:
+    sig_value = signature.removeprefix("sha1=")
+    expected = hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
+    return hmac.compare_digest(expected, sig_value)
+
+
 @router.post("/orders/{order_id}/pay")
 def initiate_pix_payment(order_id: int, current_user: dict = Depends(get_current_user)):
-    """Gera QR Code PIX via Pagar.me"""
     import requests
     from config import settings
 
@@ -453,7 +499,13 @@ def initiate_pix_payment(order_id: int, current_user: dict = Depends(get_current
         if current_user.get("role") != "admin" and order["user_id"] != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Acesso negado")
 
-    # Pagar.me payment
+        if order["pagarme_payment_id"]:
+            return {
+                "qr_code": order["pagarme_qr_code"] or "",
+                "qr_code_url": order["pagarme_qr_code_url"] or "",
+                "amount": float(order["total"]),
+            }
+
     headers = {"Authorization": f"Token {settings.PAGARME_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "mode": "gateway",
@@ -464,11 +516,18 @@ def initiate_pix_payment(order_id: int, current_user: dict = Depends(get_current
     }
 
     try:
-        resp = requests.post("https://api.pagar.me/core/v5/orders", json=payload, headers=headers, timeout=15)
+        resp = requests.post(
+            "https://api.pagar.me/core/v5/orders", json=payload, headers=headers, timeout=15
+        )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Pagar.me retornou {resp.status_code}")
+
         data = resp.json()
-        qr_code = data.get("charges", [{}])[0].get("last_transaction", {}).get("qr_code", "")
-        qr_code_url = data.get("charges", [{}])[0].get("last_transaction", {}).get("qr_code_url", "")
-        payment_id = data.get("charges", [{}])[0].get("id", "")
+        charge = data.get("charges", [{}])[0]
+        last_tx = charge.get("last_transaction", {})
+        qr_code = last_tx.get("qr_code", "")
+        qr_code_url = last_tx.get("qr_code_url", "")
+        payment_id = charge.get("id", "")
 
         with get_db_ctx() as conn:
             conn.execute(
@@ -476,14 +535,28 @@ def initiate_pix_payment(order_id: int, current_user: dict = Depends(get_current
                 (payment_id, qr_code, qr_code_url, order_id),
             )
         return {"qr_code": qr_code, "qr_code_url": qr_code_url, "amount": float(order["total"])}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao gerar PIX: {str(e)}")
 
 
 @router.post("/webhooks/pagarme")
-def pagarme_webhook(payload: dict):
-    """Webhook do Pagar.me para confirmar pagamento"""
+async def pagarme_webhook(request: Request):
     from config import settings
+
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature", "")
+
+    if settings.PAGARME_API_KEY:
+        if not signature:
+            raise HTTPException(status_code=400, detail="Assinatura ausente")
+        if not _verify_pagarme_signature(body, signature, settings.PAGARME_API_KEY):
+            raise HTTPException(status_code=400, detail="Assinatura inválida")
+    else:
+        logging.warning("PAGARME_API_KEY não configurada — webhook sem validação de assinatura")
+
+    payload = json.loads(body)
     if payload.get("current_status") == "paid":
         order_id = payload.get("order_id")
         if order_id:
@@ -493,15 +566,3 @@ def pagarme_webhook(payload: dict):
                     (int(order_id),),
                 )
     return {"ok": True}
-
-
-# ─── Serve uploaded images ─────────────────────────────────────────────────────
-
-@router.get("/uploads/{filename}")
-def serve_upload(filename: str):
-    from fastapi.responses import FileResponse
-    import os
-    path = f"/opt/craque-do-jogo/uploads/{filename}"
-    if os.path.exists(path):
-        return FileResponse(path)
-    raise HTTPException(status_code=404, detail="Arquivo não encontrado")
